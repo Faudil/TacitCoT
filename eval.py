@@ -21,21 +21,26 @@ def compute_loss(pred, target, loss_type="mse"):
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
-def val_jepa_step(sandwich_model, prompt_ids, target_ids, loss_type="mse"):
+def val_jepa_step(sandwich_model, prompt_ids, target_ids, loss_type="mse", task_id=None):
     """Computes validation loss between predicted thoughts and targets."""
     prompt_len = prompt_ids.shape[-1]
     full_input_ids = torch.cat([prompt_ids, target_ids], dim=-1)
     full_attention_mask = torch.ones_like(full_input_ids)
     
     sandwich_model.use_predictor = False
+    sandwich_model.current_task_id = task_id
+    
     with torch.no_grad():
         full_outputs = sandwich_model.model(
             input_ids=full_input_ids,
             attention_mask=full_attention_mask,
             output_hidden_states=True
         )
-        target_latents = full_outputs.hidden_states[sandwich_model.split_layer + 1][:, prompt_len:, :]
-        target_thought = target_latents.mean(dim=1)
+        
+        target_thoughts = {}
+        for lyr in sandwich_model.split_layers:
+            target_latents = full_outputs.hidden_states[lyr + 1][:, prompt_len:, :]
+            target_thoughts[str(lyr)] = target_latents.mean(dim=1)
         
         sandwich_model.use_predictor = True
         prompt_attention_mask = torch.ones_like(prompt_ids)
@@ -44,9 +49,14 @@ def val_jepa_step(sandwich_model, prompt_ids, target_ids, loss_type="mse"):
             attention_mask=prompt_attention_mask,
             output_hidden_states=True
         )
-        predicted_latents = prompt_outputs.hidden_states[sandwich_model.split_layer + 1]
-        predicted_thought = predicted_latents[:, -1, :]
         
-        loss = compute_loss(predicted_thought, target_thought, loss_type)
-        
-    return loss.item()
+        total_loss = 0.0
+        for lyr in sandwich_model.split_layers:
+            predicted_latents = prompt_outputs.hidden_states[lyr + 1]
+            predicted_thought = predicted_latents[:, -1, :]
+            
+            loss = compute_loss(predicted_thought, target_thoughts[str(lyr)], loss_type)
+            total_loss = total_loss + loss
+            
+    sandwich_model.current_task_id = None
+    return total_loss.item()

@@ -18,10 +18,21 @@ def run_benchmark(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Parse split_layer string/list/int if provided
+    split_layer_arg = args.split_layer
+    if "," in split_layer_arg:
+        split_layer_arg = [int(x.strip()) for x in split_layer_arg.split(",")]
+    else:
+        try:
+            split_layer_arg = int(split_layer_arg)
+        except ValueError:
+            pass
+
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
-        split_layer=args.split_layer,
-        predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None
+        split_layer=split_layer_arg,
+        predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
+        num_tasks=args.num_tasks
     )
 
     print(f"Loading dataset: {args.dataset_name}...")
@@ -53,7 +64,6 @@ def run_benchmark(args):
             solution = ""
             
         if question and solution:
-            # Inject parsed solution for easy extraction in the benchmarking loop
             s["solution"] = solution
             bench_samples.append(s)
             
@@ -65,6 +75,16 @@ def run_benchmark(args):
     metrics = {
         "off": {"tokens": [], "time": [], "matches": 0},
         "on": {"tokens": [], "time": [], "matches": 0}
+    }
+    
+    kl_divergences = []
+    cos_sims_logits = []
+
+    generation_kwargs = {
+        "do_sample": args.do_sample,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
     }
 
     for idx, sample in enumerate(bench_samples):
@@ -84,7 +104,13 @@ def run_benchmark(args):
 
         # Benchmark Predictor OFF
         t0 = time.time()
-        out_off = jepa_llm.generate_text(prompt, max_new_tokens=args.max_new_tokens, use_predictor=False)
+        out_off = jepa_llm.generate_text(
+            prompt, 
+            max_new_tokens=args.max_new_tokens, 
+            use_predictor=False, 
+            task_id=args.task_id, 
+            **generation_kwargs
+        )
         dt_off = time.time() - t0
         tokens_off = len(jepa_llm.tokenizer.encode(out_off, add_special_tokens=False))
         match_off = clean_match(solution, out_off)
@@ -96,7 +122,13 @@ def run_benchmark(args):
 
         # Benchmark Predictor ON
         t0 = time.time()
-        out_on = jepa_llm.generate_text(prompt, max_new_tokens=args.max_new_tokens, use_predictor=True)
+        out_on = jepa_llm.generate_text(
+            prompt, 
+            max_new_tokens=args.max_new_tokens, 
+            use_predictor=True, 
+            task_id=args.task_id, 
+            **generation_kwargs
+        )
         dt_on = time.time() - t0
         tokens_on = len(jepa_llm.tokenizer.encode(out_on, add_special_tokens=False))
         match_on = clean_match(solution, out_on)
@@ -105,6 +137,14 @@ def run_benchmark(args):
         metrics["on"]["time"].append(dt_on)
         if match_on:
             metrics["on"]["matches"] += 1
+
+        # Measure logit bias
+        try:
+            bias = jepa_llm.measure_logit_bias(prompt, task_id=args.task_id)
+            kl_divergences.append(bias["kl_divergence"])
+            cos_sims_logits.append(bias["cosine_similarity_logits"])
+        except Exception:
+            pass
 
         print(f"  Predictor OFF: {tokens_off} tokens in {dt_off:.2f}s | Match: {match_off}")
         print(f"  Predictor ON : {tokens_on} tokens in {dt_on:.2f}s | Match: {match_on}")
@@ -118,6 +158,9 @@ def run_benchmark(args):
 
     acc_off = (metrics["off"]["matches"] / len(bench_samples)) * 100
     acc_on = (metrics["on"]["matches"] / len(bench_samples)) * 100
+    
+    avg_kl = sum(kl_divergences) / len(kl_divergences) if kl_divergences else 0.0
+    avg_cos_sim_logits = sum(cos_sims_logits) / len(cos_sims_logits) if cos_sims_logits else 1.0
 
     print("\n" + "="*45)
     print("              BENCHMARK RESULTS              ")
@@ -132,17 +175,26 @@ def run_benchmark(args):
     print(f"  Accuracy (Match Rate):    {acc_on:.1f}%")
     print("-" * 45)
     print(f"Tokens Spared: {spared_tokens:.2f} tokens ({ (spared_tokens / max(1, avg_tok_off)) * 100:.1f}% savings)")
+    print(f"\nInterpretability Analysis (Over Benchmark Prompts):")
+    print(f"  Average logit KL-divergence (with vs. without predictor): {avg_kl:.4f}")
+    print(f"  Average logit cosine similarity (with vs. without predictor): {avg_cos_sim_logits:.4f}")
     print("="*45)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="JEPA LLM Sandwich Benchmark")
     parser.add_argument("--model_name", type=str, default="HuggingFaceTB/SmolLM3-3B", help="Model name or path")
-    parser.add_argument("--split_layer", type=int, default=18, help="Split layer index")
+    parser.add_argument("--split_layer", type=str, default="18", help="Split layer index or indices (comma-separated)")
     parser.add_argument("--predictor_path", type=str, default="jepa_predictor.pt", help="Path to predictor weights")
     parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset name")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to evaluate on")
-    parser.add_argument("--max_new_tokens", type=int, default=65536, help="Max new tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=100, help="Max new tokens to generate")
+    parser.add_argument("--do_sample", action="store_true", help="Use sampling during generation")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling top-p")
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
+    parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
+    parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning")
     args = parser.parse_args()
     
     run_benchmark(args)

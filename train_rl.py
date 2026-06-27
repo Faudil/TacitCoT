@@ -28,7 +28,7 @@ def compute_reward(solution, generated_text, gen_tokens, max_new_tokens):
     else:
         return 0.0
 
-def evaluate_accuracy(jepa_llm, val_dataset, max_new_tokens):
+def evaluate_accuracy(jepa_llm, val_dataset, max_new_tokens, task_id=None):
     """Deterministically evaluates the model's accuracy on the validation set."""
     jepa_llm.predictor.eval()
     matches = 0
@@ -54,7 +54,7 @@ def evaluate_accuracy(jepa_llm, val_dataset, max_new_tokens):
             prompt = f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
             
         with torch.no_grad():
-            out_text = jepa_llm.generate_text(prompt, max_new_tokens=max_new_tokens, use_predictor=True)
+            out_text = jepa_llm.generate_text(prompt, max_new_tokens=max_new_tokens, use_predictor=True, task_id=task_id)
             
         if solution.lower() in out_text.lower():
             matches += 1
@@ -66,12 +66,23 @@ def train_rl(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Parse split_layer string/list/int if provided
+    split_layer_arg = args.split_layer
+    if "," in split_layer_arg:
+        split_layer_arg = [int(x.strip()) for x in split_layer_arg.split(",")]
+    else:
+        try:
+            split_layer_arg = int(split_layer_arg)
+        except ValueError:
+            pass
+
     # Load sandwich wrapper
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
-        split_layer=args.split_layer,
+        split_layer=split_layer_arg,
         predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
-        predictor_type=args.predictor_type
+        predictor_type=args.predictor_type,
+        num_tasks=args.num_tasks
     )
 
     optimizer = torch.optim.AdamW(jepa_llm.predictor.parameters(), lr=args.lr)
@@ -139,20 +150,22 @@ def train_rl(args):
                 prompt = f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
 
             prompt_ids = jepa_llm.tokenizer(prompt, return_tensors="pt").input_ids.to(jepa_llm.model.device)
-            prompt_len = prompt_ids.shape[-1]
 
             # 1. Rollout: Generate text under stochastic sampling policy (Predictor ON)
-            jepa_llm.use_predictor = True
-            with torch.no_grad():
-                outputs = jepa_llm.model.generate(
-                    input_ids=prompt_ids,
+            try:
+                gen_tokens, _ = jepa_llm.sample(
+                    prompt_ids=prompt_ids,
                     max_new_tokens=args.max_new_tokens,
-                    do_sample=True,
                     temperature=args.temperature,
-                    pad_token_id=jepa_llm.tokenizer.eos_token_id
+                    top_k=50,
+                    top_p=1.0,
+                    use_predictor=True,
+                    task_id=args.task_id
                 )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                continue
             
-            gen_tokens = outputs[0][prompt_len:]
             if len(gen_tokens) == 0:
                 continue
                 
@@ -163,24 +176,13 @@ def train_rl(args):
             epoch_rewards.append(reward)
 
             # 3. Policy Gradient Step (REINFORCE)
-            # Reconstruct the sequence and compute logits with gradient tracking active for the predictor
-            full_ids = torch.cat([prompt_ids, gen_tokens.unsqueeze(0)], dim=-1)
-            
             try:
-                prompt_attention_mask = torch.ones_like(full_ids)
-                outputs_grad = jepa_llm.model(
-                    input_ids=full_ids,
-                    attention_mask=prompt_attention_mask,
-                    output_hidden_states=True
+                sequence_log_prob = jepa_llm.compute_sequence_log_probs(
+                    prompt_ids=prompt_ids,
+                    gen_tokens=gen_tokens,
+                    use_predictor=True,
+                    task_id=args.task_id
                 )
-                
-                # Get logits for the generated tokens
-                logits = outputs_grad.logits[:, prompt_len - 1 : -1, :] # shape: [1, gen_len, vocab_size]
-                log_probs = torch.log_softmax(logits, dim=-1)
-                
-                # Gather log-probabilities of the generated tokens
-                gen_log_probs = log_probs.gather(dim=-1, index=gen_tokens.unsqueeze(0).unsqueeze(-1)).squeeze(-1)
-                sequence_log_prob = gen_log_probs.sum(dim=-1)
                 
                 # Policy Gradient Loss: - (Reward - Baseline) * LogProb
                 advantage = reward - baseline
@@ -213,10 +215,10 @@ def train_rl(args):
 
         # Evaluation & Checkpointing
         print("Running validation accuracy check...")
-        accuracy = evaluate_accuracy(jepa_llm, val_dataset, args.max_new_tokens)
+        accuracy = evaluate_accuracy(jepa_llm, val_dataset, args.max_new_tokens, task_id=args.task_id)
         
         train_acc_subset = random.sample(train_dataset, min(len(train_dataset), args.val_samples))
-        train_accuracy = evaluate_accuracy(jepa_llm, train_acc_subset, args.max_new_tokens)
+        train_accuracy = evaluate_accuracy(jepa_llm, train_acc_subset, args.max_new_tokens, task_id=args.task_id)
         print(f"Training Accuracy (subset): {train_accuracy:.2f}% | Validation Accuracy: {accuracy:.2f}% (Best: {best_accuracy:.2f}%)")
         
         if accuracy > best_accuracy:
@@ -227,7 +229,7 @@ def train_rl(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="JEPA LLM Sandwich RL training (REINFORCE)")
     parser.add_argument("--model_name", type=str, default="HuggingFaceTB/SmolLM3-3B", help="Model name or path")
-    parser.add_argument("--split_layer", type=int, default=18, help="Split layer index")
+    parser.add_argument("--split_layer", type=str, default="18", help="Split layer index or indices (comma-separated)")
     parser.add_argument("--predictor_path", type=str, default="jepa_predictor_rl.pt", help="Path to save predictor")
     parser.add_argument("--predictor_type", type=str, default="mlp", choices=["mlp", "transformer", "trs"], help="Predictor type")
     parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset name")
@@ -239,6 +241,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=100, help="Max output tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Stochastic policy temperature")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
+    parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
+    parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning during training/generation")
     args = parser.parse_args()
 
     random.seed(args.seed)

@@ -9,21 +9,26 @@ import random
 from model import JEPALangSandwich
 from eval import val_jepa_step, compute_loss
 
-def train_jepa_step(sandwich_model, prompt_ids, target_ids, optimizer, loss_type="mse", grad_accum_steps=1, is_step=True):
+def train_jepa_step(sandwich_model, prompt_ids, target_ids, optimizer, loss_type="mse", grad_accum_steps=1, is_step=True, task_id=None):
     """Executes a single optimization step minimizing loss between predicted and target thoughts."""
     prompt_len = prompt_ids.shape[-1]
     full_input_ids = torch.cat([prompt_ids, target_ids], dim=-1)
     full_attention_mask = torch.ones_like(full_input_ids)
     
     sandwich_model.use_predictor = False
+    sandwich_model.current_task_id = task_id
+    
     with torch.no_grad():
         full_outputs = sandwich_model.model(
             input_ids=full_input_ids,
             attention_mask=full_attention_mask,
             output_hidden_states=True
         )
-        target_latents = full_outputs.hidden_states[sandwich_model.split_layer + 1][:, prompt_len:, :]
-        target_thought = target_latents.mean(dim=1)
+        
+        target_thoughts = {}
+        for lyr in sandwich_model.split_layers:
+            target_latents = full_outputs.hidden_states[lyr + 1][:, prompt_len:, :]
+            target_thoughts[str(lyr)] = target_latents.mean(dim=1)
 
     sandwich_model.use_predictor = True
     prompt_attention_mask = torch.ones_like(prompt_ids)
@@ -32,20 +37,28 @@ def train_jepa_step(sandwich_model, prompt_ids, target_ids, optimizer, loss_type
         attention_mask=prompt_attention_mask,
         output_hidden_states=True
     )
-    predicted_latents = prompt_outputs.hidden_states[sandwich_model.split_layer + 1]
-    predicted_thought = predicted_latents[:, -1, :]
+    
+    total_loss = 0.0
+    for lyr in sandwich_model.split_layers:
+        predicted_latents = prompt_outputs.hidden_states[lyr + 1]
+        predicted_thought = predicted_latents[:, -1, :]
+        
+        loss = compute_loss(predicted_thought, target_thoughts[str(lyr)], loss_type)
+        total_loss = total_loss + loss
 
-    loss = compute_loss(predicted_thought, target_thought, loss_type)
-    scaled_loss = loss / grad_accum_steps
+    scaled_loss = total_loss / grad_accum_steps
     scaled_loss.backward()
 
     if is_step:
         optimizer.step()
         optimizer.zero_grad()
 
-    return loss.item()
+    # Clean up task ID
+    sandwich_model.current_task_id = None
 
-def evaluate_accuracy(jepa_llm, samples, max_new_tokens=100):
+    return total_loss.item()
+
+def evaluate_accuracy(jepa_llm, samples, max_new_tokens=100, task_id=None):
     """Deterministically evaluates the model's accuracy (match rate) on a given list of samples."""
     jepa_llm.predictor.eval()
     matches = 0
@@ -77,7 +90,7 @@ def evaluate_accuracy(jepa_llm, samples, max_new_tokens=100):
             prompt = f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
             
         with torch.no_grad():
-            out_text = jepa_llm.generate_text(prompt, max_new_tokens=max_new_tokens, use_predictor=True)
+            out_text = jepa_llm.generate_text(prompt, max_new_tokens=max_new_tokens, use_predictor=True, task_id=task_id)
             
         if solution.lower() in out_text.lower():
             matches += 1
@@ -89,11 +102,22 @@ def train_jepa(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using main device: {device}")
 
+    # Parse split_layer string/list/int if provided
+    split_layer_arg = args.split_layer
+    if "," in split_layer_arg:
+        split_layer_arg = [int(x.strip()) for x in split_layer_arg.split(",")]
+    else:
+        try:
+            split_layer_arg = int(split_layer_arg)
+        except ValueError:
+            pass
+
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
-        split_layer=args.split_layer,
+        split_layer=split_layer_arg,
         predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
-        predictor_type=args.predictor_type
+        predictor_type=args.predictor_type,
+        num_tasks=args.num_tasks
     )
 
     optimizer = torch.optim.AdamW(jepa_llm.predictor.parameters(), lr=args.lr)
@@ -136,7 +160,10 @@ def train_jepa(args):
         # Shuffle training set each epoch
         random.shuffle(train_dataset)
         
-        for idx, sample in enumerate(train_dataset):
+        # Limit training samples if requested
+        epoch_train_dataset = train_dataset[:args.num_samples] if args.num_samples else train_dataset
+        
+        for idx, sample in enumerate(epoch_train_dataset):
             question = sample.get("question", "")
             
             if "deepseek_thinking_trajectory" in sample:
@@ -186,7 +213,8 @@ def train_jepa(args):
                     optimizer=optimizer,
                     loss_type=args.loss_type,
                     grad_accum_steps=args.grad_accum_steps,
-                    is_step=is_step
+                    is_step=is_step,
+                    task_id=args.task_id
                 )
                 accumulated_loss += loss_val
                 epoch_loss += loss_val
@@ -255,7 +283,8 @@ def train_jepa(args):
                     sandwich_model=jepa_llm,
                     prompt_ids=val_prompt_ids,
                     target_ids=val_target_ids,
-                    loss_type=args.loss_type
+                    loss_type=args.loss_type,
+                    task_id=args.task_id
                 )
                 val_loss_sum += loss_val
                 val_count += 1
@@ -269,8 +298,8 @@ def train_jepa(args):
         # Calculate training and validation correctness accuracies
         print("Evaluating generation accuracies...")
         train_acc_subset = random.sample(train_dataset, min(len(train_dataset), 20))
-        train_accuracy = evaluate_accuracy(jepa_llm, train_acc_subset, max_new_tokens=100)
-        val_accuracy = evaluate_accuracy(jepa_llm, val_dataset[:20] if len(val_dataset) > 20 else val_dataset, max_new_tokens=100)
+        train_accuracy = evaluate_accuracy(jepa_llm, train_acc_subset, max_new_tokens=100, task_id=args.task_id)
+        val_accuracy = evaluate_accuracy(jepa_llm, val_dataset[:20] if len(val_dataset) > 20 else val_dataset, max_new_tokens=100, task_id=args.task_id)
         print(f"Epoch {epoch + 1} | Training Accuracy (subset): {train_accuracy:.2f}% | Validation Accuracy: {val_accuracy:.2f}%")
         
         if avg_val_loss < best_val_loss:
@@ -283,8 +312,8 @@ def train_jepa(args):
         print(f"Prompt: {vis_prompt}")
         with torch.no_grad():
             try:
-                out_without = jepa_llm.generate_text(vis_prompt, max_new_tokens=80, use_predictor=False)
-                out_with = jepa_llm.generate_text(vis_prompt, max_new_tokens=80, use_predictor=True)
+                out_without = jepa_llm.generate_text(vis_prompt, max_new_tokens=80, use_predictor=False, task_id=args.task_id)
+                out_with = jepa_llm.generate_text(vis_prompt, max_new_tokens=80, use_predictor=True, task_id=args.task_id)
                 print(f"-> Predictor OFF (Base Model):\n{out_without}\n")
                 print(f"-> Predictor ON  (JEPA Guided):\n{out_with}\n")
             except Exception as e:
@@ -293,7 +322,7 @@ def train_jepa(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="JEPA LLM Sandwich Training")
     parser.add_argument("--model_name", type=str, default="HuggingFaceTB/SmolLM3-3B", help="Name or path of the base LLM")
-    parser.add_argument("--split_layer", type=int, default=18, help="Layer index to insert the predictor")
+    parser.add_argument("--split_layer", type=str, default="18", help="Layer index or indices (comma-separated) to insert the predictor")
     parser.add_argument("--predictor_path", type=str, default="jepa_predictor.pt", help="Path to load/save the predictor")
     parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset name")
     parser.add_argument("--predictor_type", type=str, default="mlp", choices=["mlp", "transformer", "trs"], help="Type of predictor architecture")
@@ -304,6 +333,9 @@ if __name__ == "__main__":
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation ratio")
     parser.add_argument("--max_length", type=int, default=2048, help="Max length")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
+    parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
+    parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning during training/generation")
+    parser.add_argument("--num_samples", type=int, default=None, help="Limit number of training samples per epoch")
     args = parser.parse_args()
 
     random.seed(args.seed)
