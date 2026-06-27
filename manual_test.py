@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
     parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning")
     parser.add_argument("--target_cot", type=str, default=None, help="Optional target CoT sequence to measure similarity against")
+    parser.add_argument("--sandwich_type", type=str, default="standard", choices=["standard", "reasoning"], help="Type of target extractor strategy to inject")
+    parser.add_argument("--last_token_only", action=argparse.BooleanOptionalAction, default=True, help="Only modify the last token position during intervention (preserves KV cache)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -38,11 +40,19 @@ def main():
         except ValueError:
             pass
 
+    from target_extractors import ResponseTargetExtractor, ThinkingTargetExtractor
+    if args.sandwich_type == "reasoning":
+        target_extractor = ThinkingTargetExtractor()
+    else:
+        target_extractor = ResponseTargetExtractor()
+
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
         split_layer=split_layer_arg,
         predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
-        num_tasks=args.num_tasks
+        num_tasks=args.num_tasks,
+        target_extractor=target_extractor,
+        last_token_only=args.last_token_only
     )
 
     generation_kwargs = {

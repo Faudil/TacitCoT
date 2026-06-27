@@ -7,54 +7,225 @@ from datasets import load_dataset
 import random
 
 from model import JEPALangSandwich
-from eval import val_jepa_step, compute_loss
+from eval import compute_loss
 
-def train_jepa_step(sandwich_model, prompt_ids, target_ids, optimizer, loss_type="mse", grad_accum_steps=1, is_step=True, task_id=None):
+def train_jepa_step(sandwich_model, prompt_ids, target_ids, optimizer, loss_type="mse", grad_accum_steps=1, is_step=True, task_id=None, cache=None, cache_key=None):
     """Executes a single optimization step minimizing loss between predicted and target thoughts."""
-    prompt_len = prompt_ids.shape[-1]
-    full_input_ids = torch.cat([prompt_ids, target_ids], dim=-1)
-    full_attention_mask = torch.ones_like(full_input_ids)
+    device = next(sandwich_model.predictors.parameters()).device
     
-    sandwich_model.use_predictor = False
-    sandwich_model.current_task_id = task_id
-    
-    with torch.no_grad():
-        full_outputs = sandwich_model.model(
-            input_ids=full_input_ids,
-            attention_mask=full_attention_mask,
-            output_hidden_states=True
-        )
+    # 1. Retrieve or compute target thoughts (and prompt hidden state if single split layer)
+    if cache is not None and cache_key is not None and cache_key in cache:
+        cached_val = cache[cache_key]
+        target_thoughts = {k: v.to(device) for k, v in cached_val["target_thoughts"].items()}
+        prompt_hidden_state = cached_val["prompt_hidden_state"]
+    else:
+        prompt_len = prompt_ids.shape[-1]
+        full_input_ids = torch.cat([prompt_ids, target_ids], dim=-1)
+        full_attention_mask = torch.ones_like(full_input_ids)
         
-        target_thoughts = {}
-        for lyr in sandwich_model.split_layers:
-            target_latents = full_outputs.hidden_states[lyr + 1][:, prompt_len:, :]
-            target_thoughts[str(lyr)] = target_latents.mean(dim=1)
+        sandwich_model.use_predictor = False
+        sandwich_model.current_task_id = task_id
+        
+        with torch.no_grad():
+            full_outputs = sandwich_model.model(
+                input_ids=full_input_ids,
+                attention_mask=full_attention_mask,
+                output_hidden_states=True
+            )
+            
+            target_thoughts = sandwich_model.get_target_thoughts(full_outputs, full_input_ids, prompt_len)
+            target_thoughts = {k: v.cpu() for k, v in target_thoughts.items()}
+                
+            prompt_hidden_state = None
+            if len(sandwich_model.split_layers) == 1:
+                prompt_attention_mask = torch.ones_like(prompt_ids)
+                prompt_outputs = sandwich_model.model(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_attention_mask,
+                    output_hidden_states=True
+                )
+                lyr = sandwich_model.split_layers[0]
+                prompt_hidden_state = prompt_outputs.hidden_states[lyr + 1].cpu() # Keep on CPU
+                
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = {
+                "target_thoughts": target_thoughts,
+                "prompt_hidden_state": prompt_hidden_state
+            }
+        
+        # Keep device-mapped dictionary for computation
+        target_thoughts = {k: v.to(device) for k, v in target_thoughts.items()}
 
-    sandwich_model.use_predictor = True
-    prompt_attention_mask = torch.ones_like(prompt_ids)
-    prompt_outputs = sandwich_model.model(
-        input_ids=prompt_ids,
-        attention_mask=prompt_attention_mask,
-        output_hidden_states=True
-    )
-    
+    # 2. Forward pass with trainable predictor parameters
     total_loss = 0.0
-    for lyr in sandwich_model.split_layers:
-        predicted_latents = prompt_outputs.hidden_states[lyr + 1]
-        predicted_thought = predicted_latents[:, -1, :]
+    
+    if prompt_hidden_state is not None:
+        # Single split layer: bypass model completely
+        x = prompt_hidden_state.to(device)
+        lyr = sandwich_model.split_layers[0]
+        predictor = sandwich_model.predictors[str(lyr)]
+        
+        # Apply task conditioning if configured
+        if sandwich_model.task_embeddings is not None:
+            task_id_val = task_id if task_id is not None else 0
+            if not isinstance(task_id_val, torch.Tensor):
+                task_id_tensor = torch.tensor([task_id_val], device=device)
+            else:
+                task_id_tensor = task_id_val.to(device)
+            
+            batch_size = x.shape[0]
+            if task_id_tensor.ndim == 1 and task_id_tensor.shape[0] == 1:
+                task_id_tensor = task_id_tensor.expand(batch_size)
+                
+            task_emb_layer = sandwich_model.task_embeddings[str(lyr)]
+            task_emb = task_emb_layer(task_id_tensor).unsqueeze(1)
+            x = x + task_emb
+            
+        predictor_delta = predictor(x)
+        gate = torch.sigmoid(sandwich_model.intervention_gates[str(lyr)])
+        gated_delta = gate * predictor_delta
+        predicted_thought = (prompt_hidden_state.to(device) + gated_delta)[:, -1, :]
         
         loss = compute_loss(predicted_thought, target_thoughts[str(lyr)], loss_type)
         total_loss = total_loss + loss
+    else:
+        # Multiple split layers: run model for prompt, but use cached targets
+        sandwich_model.use_predictor = True
+        sandwich_model.current_task_id = task_id
+        
+        prompt_attention_mask = torch.ones_like(prompt_ids)
+        prompt_outputs = sandwich_model.model(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attention_mask,
+            output_hidden_states=True
+        )
+        
+        for lyr in sandwich_model.split_layers:
+            predicted_latents = prompt_outputs.hidden_states[lyr + 1]
+            predicted_thought = predicted_latents[:, -1, :]
+            
+            loss = compute_loss(predicted_thought, target_thoughts[str(lyr)], loss_type)
+            total_loss = total_loss + loss
+            
+        # Clean up task ID
+        sandwich_model.current_task_id = None
 
     scaled_loss = total_loss / grad_accum_steps
     scaled_loss.backward()
 
     if is_step:
+        # Gradient clipping to prevent runaway predictor updates
+        trainable_params = [p for p in sandwich_model.predictors.parameters() if p.requires_grad]
+        trainable_params += [p for p in sandwich_model.intervention_gates.parameters() if p.requires_grad]
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
-    # Clean up task ID
-    sandwich_model.current_task_id = None
+    return total_loss.item()
+
+
+def val_jepa_step(sandwich_model, prompt_ids, target_ids, loss_type="mse", task_id=None, cache=None, cache_key=None):
+    """Computes validation loss between predicted thoughts and targets using cached states."""
+    device = next(sandwich_model.predictors.parameters()).device
+    
+    # 1. Retrieve or compute target thoughts (and prompt hidden state if single split layer)
+    if cache is not None and cache_key is not None and cache_key in cache:
+        cached_val = cache[cache_key]
+        target_thoughts = {k: v.to(device) for k, v in cached_val["target_thoughts"].items()}
+        prompt_hidden_state = cached_val["prompt_hidden_state"]
+    else:
+        prompt_len = prompt_ids.shape[-1]
+        full_input_ids = torch.cat([prompt_ids, target_ids], dim=-1)
+        full_attention_mask = torch.ones_like(full_input_ids)
+        
+        sandwich_model.use_predictor = False
+        sandwich_model.current_task_id = task_id
+        
+        with torch.no_grad():
+            full_outputs = sandwich_model.model(
+                input_ids=full_input_ids,
+                attention_mask=full_attention_mask,
+                output_hidden_states=True
+            )
+            
+            target_thoughts = sandwich_model.get_target_thoughts(full_outputs, full_input_ids, prompt_len)
+            target_thoughts = {k: v.cpu() for k, v in target_thoughts.items()}
+                
+            prompt_hidden_state = None
+            if len(sandwich_model.split_layers) == 1:
+                prompt_attention_mask = torch.ones_like(prompt_ids)
+                prompt_outputs = sandwich_model.model(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_attention_mask,
+                    output_hidden_states=True
+                )
+                lyr = sandwich_model.split_layers[0]
+                prompt_hidden_state = prompt_outputs.hidden_states[lyr + 1].cpu() # Keep on CPU
+                
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = {
+                "target_thoughts": target_thoughts,
+                "prompt_hidden_state": prompt_hidden_state
+            }
+        
+        # Keep device-mapped dictionary for computation
+        target_thoughts = {k: v.to(device) for k, v in target_thoughts.items()}
+
+    # 2. Forward pass with predictor
+    total_loss = 0.0
+    
+    if prompt_hidden_state is not None:
+        # Single split layer: bypass model completely
+        x = prompt_hidden_state.to(device)
+        lyr = sandwich_model.split_layers[0]
+        predictor = sandwich_model.predictors[str(lyr)]
+        
+        # Apply task conditioning if configured
+        if sandwich_model.task_embeddings is not None:
+            task_id_val = task_id if task_id is not None else 0
+            if not isinstance(task_id_val, torch.Tensor):
+                task_id_tensor = torch.tensor([task_id_val], device=device)
+            else:
+                task_id_tensor = task_id_val.to(device)
+            
+            batch_size = x.shape[0]
+            if task_id_tensor.ndim == 1 and task_id_tensor.shape[0] == 1:
+                task_id_tensor = task_id_tensor.expand(batch_size)
+                
+            task_emb_layer = sandwich_model.task_embeddings[str(lyr)]
+            task_emb = task_emb_layer(task_id_tensor).unsqueeze(1)
+            x = x + task_emb
+            
+        with torch.no_grad():
+            predictor_delta = predictor(x)
+            gate = torch.sigmoid(sandwich_model.intervention_gates[str(lyr)])
+            gated_delta = gate * predictor_delta
+            predicted_thought = (prompt_hidden_state.to(device) + gated_delta)[:, -1, :]
+            
+            loss = compute_loss(predicted_thought, target_thoughts[str(lyr)], loss_type)
+            total_loss = total_loss + loss
+    else:
+        # Multiple split layers: run model for prompt, but use cached targets
+        sandwich_model.use_predictor = True
+        sandwich_model.current_task_id = task_id
+        
+        prompt_attention_mask = torch.ones_like(prompt_ids)
+        with torch.no_grad():
+            prompt_outputs = sandwich_model.model(
+                input_ids=prompt_ids,
+                attention_mask=prompt_attention_mask,
+                output_hidden_states=True
+            )
+            
+            for lyr in sandwich_model.split_layers:
+                predicted_latents = prompt_outputs.hidden_states[lyr + 1]
+                predicted_thought = predicted_latents[:, -1, :]
+                
+                loss = compute_loss(predicted_thought, target_thoughts[str(lyr)], loss_type)
+                total_loss = total_loss + loss
+            
+        # Clean up task ID
+        sandwich_model.current_task_id = None
 
     return total_loss.item()
 
@@ -112,15 +283,46 @@ def train_jepa(args):
         except ValueError:
             pass
 
+    from target_extractors import ResponseTargetExtractor, ThinkingTargetExtractor
+    if args.sandwich_type == "reasoning":
+        target_extractor = ThinkingTargetExtractor()
+    else:
+        target_extractor = ResponseTargetExtractor()
+
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
         split_layer=split_layer_arg,
         predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
         predictor_type=args.predictor_type,
-        num_tasks=args.num_tasks
+        num_tasks=args.num_tasks,
+        target_extractor=target_extractor,
+        last_token_only=args.last_token_only
     )
 
-    optimizer = torch.optim.AdamW(jepa_llm.predictor.parameters(), lr=args.lr)
+    # Include both predictor and intervention gate parameters in optimizer
+    trainable_params = list(jepa_llm.predictor.parameters()) + list(jepa_llm.intervention_gates.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    
+    # Initialize cache for precomputed frozen weights results (lazy-caching on CPU)
+    state_cache = {}
+    if args.cache_path and os.path.exists(args.cache_path):
+        print(f"Loading state cache from {args.cache_path}...", flush=True)
+        try:
+            loaded_cache = torch.load(args.cache_path, map_location="cpu")
+            if isinstance(loaded_cache, dict) and "metadata" in loaded_cache and "data" in loaded_cache:
+                meta = loaded_cache["metadata"]
+                if (meta.get("model_name") == args.model_name and 
+                        meta.get("split_layer") == args.split_layer and 
+                        meta.get("sandwich_type") == args.sandwich_type):
+                    state_cache = loaded_cache["data"]
+                    print(f"Loaded {len(state_cache)} cached states successfully.", flush=True)
+                else:
+                    print("Warning: Cached states are incompatible with current model config (mismatch in model_name, split_layer, or sandwich_type). Starting with empty cache.", flush=True)
+            else:
+                state_cache = loaded_cache
+                print(f"Loaded {len(state_cache)} cached states successfully (legacy format).", flush=True)
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Starting with empty cache.", flush=True)
 
     print(f"Loading dataset: {args.dataset_name}...")
     if args.dataset_name == "gsm8k":
@@ -156,6 +358,8 @@ def train_jepa(args):
         epoch_loss = 0.0
         step_count = 0
         accumulated_loss = 0.0
+        cache_hits = 0
+        cache_misses = 0
         
         # Shuffle training set each epoch
         random.shuffle(train_dataset)
@@ -194,6 +398,11 @@ def train_jepa(args):
             except Exception:
                 prompt = f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
                 
+            if prompt in state_cache:
+                cache_hits += 1
+            else:
+                cache_misses += 1
+                
             target_answer = f"<think>\n{cot}\n</think>\n{solution}" if cot else solution
                 
             prompt_ids = jepa_llm.tokenizer(prompt, return_tensors="pt").input_ids.to(jepa_llm.model.device)
@@ -203,7 +412,7 @@ def train_jepa(args):
             if total_len > args.max_length:
                 continue
                 
-            is_step = ((idx + 1) % args.grad_accum_steps == 0) or (idx + 1 == len(train_dataset))
+            is_step = ((idx + 1) % args.grad_accum_steps == 0) or (idx + 1 == len(epoch_train_dataset))
             
             try:
                 loss_val = train_jepa_step(
@@ -214,7 +423,9 @@ def train_jepa(args):
                     loss_type=args.loss_type,
                     grad_accum_steps=args.grad_accum_steps,
                     is_step=is_step,
-                    task_id=args.task_id
+                    task_id=args.task_id,
+                    cache=state_cache,
+                    cache_key=prompt
                 )
                 accumulated_loss += loss_val
                 epoch_loss += loss_val
@@ -227,16 +438,18 @@ def train_jepa(args):
                 
             if is_step:
                 avg_loss = accumulated_loss / args.grad_accum_steps
-                if idx % (args.grad_accum_steps * 5) == 0 or idx < args.grad_accum_steps:
+                if (idx + 1) % (args.grad_accum_steps * 5) == 0 or (idx + 1) <= args.grad_accum_steps or (idx + 1 == len(epoch_train_dataset)):
                     print(f"Step {idx}/{len(train_dataset)} | Running Loss: {avg_loss:.6f}", flush=True)
                 accumulated_loss = 0.0
 
         avg_epoch_train_loss = epoch_loss / max(1, step_count)
-        print(f"Epoch {epoch + 1} Training Loss: {avg_epoch_train_loss:.6f}", flush=True)
+        print(f"Epoch {epoch + 1} Training Loss: {avg_epoch_train_loss:.6f} | Cache Hits: {cache_hits} | Cache Misses: {cache_misses}", flush=True)
         
         jepa_llm.predictor.eval()
         val_loss_sum = 0.0
         val_count = 0
+        val_cache_hits = 0
+        val_cache_misses = 0
         
         print("Running validation...")
         for val_idx, val_sample in enumerate(val_dataset):
@@ -270,6 +483,11 @@ def train_jepa(args):
             except Exception:
                 val_prompt = f"<start_of_turn>user\n{val_question}<end_of_turn>\n<start_of_turn>model\n"
                 
+            if val_prompt in state_cache:
+                val_cache_hits += 1
+            else:
+                val_cache_misses += 1
+                
             val_target = f"<think>\n{val_cot}\n</think>\n{val_solution}" if val_cot else val_solution
             val_prompt_ids = jepa_llm.tokenizer(val_prompt, return_tensors="pt").input_ids.to(jepa_llm.model.device)
             val_target_ids = jepa_llm.tokenizer(val_target, return_tensors="pt", add_special_tokens=False).input_ids.to(jepa_llm.model.device)
@@ -284,7 +502,9 @@ def train_jepa(args):
                     prompt_ids=val_prompt_ids,
                     target_ids=val_target_ids,
                     loss_type=args.loss_type,
-                    task_id=args.task_id
+                    task_id=args.task_id,
+                    cache=state_cache,
+                    cache_key=val_prompt
                 )
                 val_loss_sum += loss_val
                 val_count += 1
@@ -293,7 +513,7 @@ def train_jepa(args):
                 continue
                 
         avg_val_loss = val_loss_sum / max(1, val_count)
-        print(f"Epoch {epoch + 1} Validation Loss: {avg_val_loss:.6f}")
+        print(f"Epoch {epoch + 1} Validation Loss: {avg_val_loss:.6f} | Cache Hits: {val_cache_hits} | Cache Misses: {val_cache_misses}")
         
         # Calculate training and validation correctness accuracies
         print("Evaluating generation accuracies...")
@@ -306,6 +526,22 @@ def train_jepa(args):
             best_val_loss = avg_val_loss
             jepa_llm.save_predictor(args.predictor_path)
             print(f"New best validation loss: {best_val_loss:.6f}. Checkpoint saved.")
+            
+        if args.cache_path:
+            print(f"Saving state cache to {args.cache_path}...", flush=True)
+            try:
+                cache_to_save = {
+                    "metadata": {
+                        "model_name": args.model_name,
+                        "split_layer": args.split_layer,
+                        "sandwich_type": args.sandwich_type
+                    },
+                    "data": state_cache
+                }
+                torch.save(cache_to_save, args.cache_path)
+                print("Cache saved successfully.", flush=True)
+            except Exception as e:
+                print(f"Failed to save cache: {e}", flush=True)
             
         print("\n--- Qualitative Output Comparison (Validation Sample) ---")
         vis_prompt = random.choice(sample_vis_prompts)
@@ -331,11 +567,14 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--grad_accum_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation ratio")
-    parser.add_argument("--max_length", type=int, default=2048, help="Max length")
+    parser.add_argument("--max_length", type=int, default=8192, help="Max length")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
     parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning during training/generation")
-    parser.add_argument("--num_samples", type=int, default=None, help="Limit number of training samples per epoch")
+    parser.add_argument("--num_samples", type=int, default=1000, help="Limit number of training samples per epoch")
+    parser.add_argument("--sandwich_type", type=str, default="standard", choices=["standard", "reasoning"], help="Type of target extractor strategy to inject")
+    parser.add_argument("--cache_path", type=str, default="jepa_state_cache.pt", help="Path to load/save the precomputed state cache")
+    parser.add_argument("--last_token_only", action=argparse.BooleanOptionalAction, default=True, help="Only modify the last token position during intervention (preserves KV cache)")
     args = parser.parse_args()
 
     random.seed(args.seed)

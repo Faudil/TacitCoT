@@ -37,10 +37,7 @@ def val_jepa_step(sandwich_model, prompt_ids, target_ids, loss_type="mse", task_
             output_hidden_states=True
         )
         
-        target_thoughts = {}
-        for lyr in sandwich_model.split_layers:
-            target_latents = full_outputs.hidden_states[lyr + 1][:, prompt_len:, :]
-            target_thoughts[str(lyr)] = target_latents.mean(dim=1)
+        target_thoughts = sandwich_model.get_target_thoughts(full_outputs, full_input_ids, prompt_len)
         
         sandwich_model.use_predictor = True
         prompt_attention_mask = torch.ones_like(prompt_ids)

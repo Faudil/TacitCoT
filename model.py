@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from target_extractors import ResponseTargetExtractor
 
 def get_decoder_layers(model):
     """Dynamically locate the list of decoder layers in the model structure."""
@@ -14,8 +15,10 @@ def get_decoder_layers(model):
     raise AttributeError("Could not find decoder layers in the model structure.")
 
 class JEPALangSandwich(nn.Module):
-    def __init__(self, model_name: str, split_layer=18, predictor_path=None, predictor_type="mlp", num_tasks=None):
+    def __init__(self, model_name: str, split_layer=18, predictor_path=None, predictor_type="mlp", num_tasks=None, target_extractor=None, last_token_only=True):
         super().__init__()
+        self.target_extractor = target_extractor if target_extractor is not None else ResponseTargetExtractor()
+        self.last_token_only = last_token_only
         print(f"Loading frozen base model: {model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -93,6 +96,16 @@ class JEPALangSandwich(nn.Module):
             print(f"Split layer {lyr} is on device: {lyr_device}")
             self.predictors[str(lyr)] = self._create_predictor(self.predictor_type, self.hidden_size, lyr_device)
 
+        # Learnable intervention gates (one per split layer)
+        # Initialized to -2.0 so sigmoid(-2) ≈ 0.12 — gentle intervention at start
+        self.intervention_gates = nn.ParameterDict()
+        for lyr in self.split_layers:
+            lyr_device = next(self.layers[lyr].parameters()).device
+            self.intervention_gates[str(lyr)] = nn.Parameter(
+                torch.tensor(-2.0, device=lyr_device, dtype=torch.bfloat16)
+            )
+        print(f"Initialized intervention gates for split layers (last_token_only={self.last_token_only}).")
+
         # Task Conditioning Embedding
         self.num_tasks = num_tasks
         if num_tasks is not None:
@@ -122,6 +135,12 @@ class JEPALangSandwich(nn.Module):
 
         if predictor_path and os.path.exists(predictor_path):
             self.load_predictor(predictor_path)
+
+    def get_target_thoughts(self, full_outputs, full_input_ids, prompt_len):
+        return self.target_extractor(self.tokenizer, full_outputs, full_input_ids, prompt_len, self.split_layers)
+
+    def get_target_trajectory_rep(self, lyr_hidden_state, full_input_ids, prompt_len):
+        return self.target_extractor.get_trajectory_rep(self.tokenizer, lyr_hidden_state, full_input_ids, prompt_len)
 
     @property
     def predictor(self):
@@ -248,12 +267,19 @@ class JEPALangSandwich(nn.Module):
                 print("Successfully loaded layer-specific task embeddings.")
             print("Successfully loaded task embeddings.")
 
+        if isinstance(checkpoint, dict) and "intervention_gates_state_dict" in checkpoint:
+            self.intervention_gates.load_state_dict(checkpoint["intervention_gates_state_dict"])
+            for lyr_key, gate_param in self.intervention_gates.items():
+                print(f"  Gate layer {lyr_key}: raw={gate_param.item():.4f}, strength={torch.sigmoid(gate_param).item():.4f}")
+            print("Successfully loaded intervention gates.")
+
     def save_predictor(self, path):
         print(f"Saving predictor weights to {path}...")
         checkpoint = {
             "predictor_type": self.predictor_type,
             "split_layers": self.split_layers,
-            "state_dict": self.predictors.state_dict()
+            "state_dict": self.predictors.state_dict(),
+            "intervention_gates_state_dict": self.intervention_gates.state_dict()
         }
         if self.task_embeddings is not None:
             checkpoint["task_embeddings_state_dict"] = self.task_embeddings.state_dict()
@@ -287,10 +313,19 @@ class JEPALangSandwich(nn.Module):
                 
                 predictor_delta = predictor(x)
                 
-                # Save thought vector for interpretability
-                self.last_thought_vectors[str(layer_idx)] = predictor_delta.detach().cpu()
+                # Apply learnable intervention gate (sigmoid for [0,1] range)
+                gate = torch.sigmoid(self.intervention_gates[str(layer_idx)])
+                gated_delta = gate * predictor_delta
                 
-                transformed_states = hidden_states + predictor_delta
+                # Save thought vector for interpretability
+                self.last_thought_vectors[str(layer_idx)] = gated_delta.detach().cpu()
+                
+                if self.last_token_only:
+                    # Only modify the last token position to preserve causal KV cache
+                    transformed_states = hidden_states.clone()
+                    transformed_states[:, -1:, :] = hidden_states[:, -1:, :] + gated_delta[:, -1:, :]
+                else:
+                    transformed_states = hidden_states + gated_delta
                 
                 # Disable predictor intervention after the last split layer has run in this forward pass
                 if layer_idx == max(self.split_layers):
@@ -486,10 +521,11 @@ class JEPALangSandwich(nn.Module):
                 output_hidden_states=True
             )
             
+        target_thoughts = self.get_target_thoughts(outputs_full, inputs_full.input_ids, prompt_len)
+            
         similarities = {}
         for lyr in self.split_layers:
-            target_latents = outputs_full.hidden_states[lyr + 1][:, prompt_len:, :]
-            target_thought = target_latents.mean(dim=1) # [1, hidden_size]
+            target_thought = target_thoughts[str(lyr)] # [1, hidden_size]
             
             predicted_latents = outputs_prompt.hidden_states[lyr + 1]
             predicted_thought = predicted_latents[:, -1, :] # [1, hidden_size]
@@ -532,8 +568,8 @@ class JEPALangSandwich(nn.Module):
         # Iterate over all layers (0 to num_layers)
         num_layers = len(outputs_full.hidden_states)
         for lyr_idx in range(num_layers):
-            # target trajectory average representation over the CoT tokens
-            target_rep = outputs_full.hidden_states[lyr_idx][:, prompt_len:, :].mean(dim=1)
+            # target trajectory representation using the extractor strategy
+            target_rep = self.get_target_trajectory_rep(outputs_full.hidden_states[lyr_idx], inputs_full.input_ids, prompt_len)
             # injected trajectory representation at the last prompt token
             injected_rep = outputs_prompt.hidden_states[lyr_idx][:, -1, :]
             

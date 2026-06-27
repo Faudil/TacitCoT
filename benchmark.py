@@ -28,11 +28,19 @@ def run_benchmark(args):
         except ValueError:
             pass
 
+    from target_extractors import ResponseTargetExtractor, ThinkingTargetExtractor
+    if args.sandwich_type == "reasoning":
+        target_extractor = ThinkingTargetExtractor()
+    else:
+        target_extractor = ResponseTargetExtractor()
+
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
         split_layer=split_layer_arg,
         predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
-        num_tasks=args.num_tasks
+        num_tasks=args.num_tasks,
+        target_extractor=target_extractor,
+        last_token_only=args.last_token_only
     )
 
     print(f"Loading dataset: {args.dataset_name}...")
@@ -187,7 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--predictor_path", type=str, default="jepa_predictor.pt", help="Path to predictor weights")
     parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset name")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to evaluate on")
-    parser.add_argument("--max_new_tokens", type=int, default=100, help="Max new tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=16192, help="Max new tokens to generate")
     parser.add_argument("--do_sample", action="store_true", help="Use sampling during generation")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling top-p")
@@ -195,6 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
     parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning")
+    parser.add_argument("--sandwich_type", type=str, default="standard", choices=["standard", "reasoning"], help="Type of target extractor strategy to inject")
+    parser.add_argument("--last_token_only", action=argparse.BooleanOptionalAction, default=True, help="Only modify the last token position during intervention (preserves KV cache)")
     args = parser.parse_args()
     
     run_benchmark(args)

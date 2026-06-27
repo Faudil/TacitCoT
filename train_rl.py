@@ -76,16 +76,26 @@ def train_rl(args):
         except ValueError:
             pass
 
+    from target_extractors import ResponseTargetExtractor, ThinkingTargetExtractor
+    if args.sandwich_type == "reasoning":
+        target_extractor = ThinkingTargetExtractor()
+    else:
+        target_extractor = ResponseTargetExtractor()
+
     # Load sandwich wrapper
     jepa_llm = JEPALangSandwich(
         model_name=args.model_name,
         split_layer=split_layer_arg,
         predictor_path=args.predictor_path if os.path.exists(args.predictor_path) else None,
         predictor_type=args.predictor_type,
-        num_tasks=args.num_tasks
+        num_tasks=args.num_tasks,
+        target_extractor=target_extractor,
+        last_token_only=args.last_token_only
     )
 
-    optimizer = torch.optim.AdamW(jepa_llm.predictor.parameters(), lr=args.lr)
+    # Include both predictor and intervention gate parameters in optimizer
+    trainable_params = list(jepa_llm.predictor.parameters()) + list(jepa_llm.intervention_gates.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
     # Load dataset
     print(f"Loading dataset: {args.dataset_name}...")
@@ -243,6 +253,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     parser.add_argument("--num_tasks", type=int, default=None, help="Number of tasks for task-conditioned embeddings")
     parser.add_argument("--task_id", type=int, default=None, help="Specific task ID for conditioning during training/generation")
+    parser.add_argument("--sandwich_type", type=str, default="standard", choices=["standard", "reasoning"], help="Type of target extractor strategy to inject")
+    parser.add_argument("--last_token_only", action=argparse.BooleanOptionalAction, default=True, help="Only modify the last token position during intervention (preserves KV cache)")
     args = parser.parse_args()
 
     random.seed(args.seed)
